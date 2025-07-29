@@ -1,4 +1,6 @@
+
 # GSPO (Group Sequence Policy Optimization) Implementation
+**⚠️ Warning: This is an experimental implementation. It is not optimized for production use and is not fully featured. Use at your own risk.**
 
 A PyTorch implementation of Group Sequence Policy Optimization (GSPO) for training large language models with reinforcement learning, based on the paper ["Group Sequence Policy Optimization"](https://arxiv.org/abs/2507.18071) by the Qwen Team at Alibaba Inc.
 
