@@ -6,6 +6,9 @@ from typing import Dict, List, Tuple, Optional, Union, Any
 import numpy as np
 import logging
 from pathlib import Path
+from collections import defaultdict
+import time
+from contextlib import contextmanager
 from .config import GSPOConfig
 from .reward_model import BaseRewardModel
 
@@ -73,6 +76,71 @@ class GSPOTrainer:
         # Setup output directory
         self.output_dir = Path(config.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Benchmarking state
+        self.benchmark_data = defaultdict(list)
+        self.benchmark_count = 0
+
+    @contextmanager
+    def benchmark_section(self, name: str):
+        """
+        Context manager for timing code sections with CUDA synchronization.
+
+        Args:
+            name: Name of the section to benchmark
+        """
+        if not self.config.report_benchmarks:
+            yield
+            return
+
+        # Skip during warmup
+        if self.global_step < self.config.benchmark_warmup_steps:
+            yield
+            return
+
+        # Initialize events
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+
+        # Synchronize and record start time
+        torch.cuda.synchronize()
+        start_event.record()
+        cpu_start = time.perf_counter()
+
+        try:
+            yield
+        finally:
+            # Record end time and synchronize
+            end_event.record()
+            torch.cuda.synchronize()
+
+            # Calculate times
+            cuda_time = start_event.elapsed_time(end_event) / 1000.0  # ms to seconds
+            cpu_time = time.perf_counter() - cpu_start
+
+            # Store benchmark data
+            self.benchmark_data[name].append({
+                "cuda": cuda_time,
+                "cpu": cpu_time
+            })
+
+    def log_benchmarks(self):
+        """Log averaged benchmark results for the current accumulation"""
+        if not self.benchmark_data:
+            return
+
+        logger.info("⏱️ Benchmark Results (avg over last {} steps):".format(
+            self.config.logging_steps))
+
+        # Calculate averages
+        for section, times in self.benchmark_data.items():
+            if times:
+                avg_cuda = sum(t['cuda'] for t in times) / len(times)
+                avg_cpu = sum(t['cpu'] for t in times) / len(times)
+                logger.info(f"  {section}:")
+                logger.info(f"    CUDA: {avg_cuda:.6f}s")
+                logger.info(f"    CPU:  {avg_cpu:.6f}s")
+                logger.info(f"    Samples: {len(times)}")
 
     def compute_sequence_likelihood_ratio(
         self,
@@ -212,7 +280,7 @@ class GSPOTrainer:
             Advantages with shape (batch_size,)
         """
         batch_size = rewards.shape[0]
-        num_groups = batch_size // group_size
+        num_groups = batch_size / group_size
 
         # Reshape to group format
         rewards_grouped = rewards.view(num_groups, group_size)
@@ -320,26 +388,91 @@ class GSPOTrainer:
         Perform a single training step.
 
         Args:
-            batch: Batch containing 'input_ids', 'attention_mask', 'response_mask', 'rewards'
+            batch: Batch containing 'input_ids', 'attention_mask', 'queries'
 
         Returns:
             Loss and metrics
         """
-        input_ids = batch['input_ids']
-        attention_mask = batch['attention_mask']
-        response_mask = batch['response_mask']
-        rewards = batch['rewards']
+        # Generate responses
+        with self.benchmark_section("response_generation"):
+            # Generate responses for each query
+            generated = self.model.generate(
+                input_ids=batch['input_ids'],
+                attention_mask=batch['attention_mask'],
+                max_length=self.config.max_length,
+                pad_token_id=self.tokenizer.pad_token_id,
+                eos_token_id=self.tokenizer.eos_token_id,
+                do_sample=True,
+                top_p=0.9,
+                temperature=0.7,
+                num_return_sequences=self.config.group_size
+            )
+
+            # Create response mask
+            query_lengths = batch['attention_mask'].sum(dim=1)
+            response_mask = torch.zeros_like(generated, dtype=torch.float32)
+            for i, q_len in enumerate(query_lengths):
+                # For each group member
+                for j in range(self.config.group_size):
+                    idx = i * self.config.group_size + j
+                    response_mask[idx, q_len:] = 1
+
+            # Decode responses
+            responses = self.tokenizer.batch_decode(
+                generated, skip_special_tokens=True
+            )
+
+        # Compute rewards
+        with self.benchmark_section("reward_computation"):
+            # Repeat queries for group_size
+            repeated_queries = [
+                q for q in batch['queries']
+                for _ in range(self.config.group_size)
+            ]
+            rewards = self.reward_model(repeated_queries, responses)
+
+        # Update batch with generated data
+        batch = {
+            'input_ids': generated,
+            'attention_mask': (generated != self.tokenizer.pad_token_id).long(),
+            'response_mask': response_mask,
+            'rewards': rewards
+        }
+
+        # Track benchmark count
+        if self.config.report_benchmarks:
+            self.benchmark_count += 1
 
         # Compute advantages
-        advantages = self.compute_advantages(rewards, self.config.group_size)
+        with self.benchmark_section("advantage_calculation"):
+            advantages = self.compute_advantages(rewards, self.config.group_size)
 
         # Get token-level advantages if using GSPO-token
         token_level_advantages = batch.get('token_advantages', None)
 
         # Compute loss
-        loss, metrics = self.compute_gspo_loss(
-            input_ids, attention_mask, response_mask, advantages, token_level_advantages
-        )
+        with self.benchmark_section("loss_computation"):
+            loss, metrics = self.compute_gspo_loss(
+                batch['input_ids'],
+                batch['attention_mask'],
+                batch['response_mask'],
+                advantages,
+                token_level_advantages
+            )
+
+        # Backward pass
+        with self.benchmark_section("backward_pass"):
+            loss = loss / self.config.gradient_accumulation_steps
+            loss.backward()
+
+        # Log benchmarks at specified intervals
+        if (self.config.report_benchmarks and
+            self.benchmark_count >= self.config.logging_steps and
+            self.global_step > self.config.benchmark_warmup_steps):
+
+            self.log_benchmarks()
+            self.benchmark_data.clear()
+            self.benchmark_count = 0
 
         return loss, metrics
 
@@ -358,25 +491,7 @@ class GSPOTrainer:
             # Forward pass
             loss, metrics = self.training_step(batch)
 
-            # Backward pass
-            loss = loss / self.config.gradient_accumulation_steps
-            loss.backward()
-
-            if (step + 1) % self.config.gradient_accumulation_steps == 0:
-                # Gradient clipping
-                torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(),
-                    self.config.max_grad_norm
-                )
-
-                # Optimizer step
-                self.optimizer.step()
-                if self.lr_scheduler is not None:
-                    self.lr_scheduler.step()
-                self.optimizer.zero_grad()
-
-                self.global_step += 1
-
+            # Accumulate loss
             total_loss += loss.item()
 
             # Update epoch metrics
@@ -384,6 +499,23 @@ class GSPOTrainer:
                 if k not in epoch_metrics:
                     epoch_metrics[k] = []
                 epoch_metrics[k].append(v)
+
+            # Optimizer step
+            if (step + 1) % self.config.gradient_accumulation_steps == 0:
+                with self.benchmark_section("optimizer_step"):
+                    # Gradient clipping
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(),
+                        self.config.max_grad_norm
+                    )
+
+                    # Optimizer step
+                    self.optimizer.step()
+                    if self.lr_scheduler is not None:
+                        self.lr_scheduler.step()
+                    self.optimizer.zero_grad()
+
+                self.global_step += 1
 
             # Logging
             if self.global_step % self.config.logging_steps == 0:

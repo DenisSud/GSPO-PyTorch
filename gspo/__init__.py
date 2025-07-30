@@ -10,8 +10,8 @@ from .config import GSPOConfig
 from .reward_model import BaseRewardModel
 
 __version__ = "0.1.0"
-__author__ = "Your Name"
-__email__ = "your.email@example.com"
+__author__ = "Denis Sudakov"
+__email__ = "sudakov.denis.2007@gmail.com"
 
 __all__ = [
     "GSPOTrainer",

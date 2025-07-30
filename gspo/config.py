@@ -1,5 +1,5 @@
-from dataclasses import dataclass
-from typing import Dict, Any, Union
+from dataclasses import dataclass, field
+from typing import Dict, Any, Union, List
 from pathlib import Path
 import json
 
@@ -47,6 +47,10 @@ class GSPOConfig:
 
     # Token-level variant
     use_token_level: bool = False  # Whether to use GSPO-token variant
+
+    # Benchmarking parameters
+    report_benchmarks: bool = False
+    benchmark_warmup_steps: int = 5  # Skip first N steps for warmup
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert config to dictionary."""
