@@ -479,54 +479,69 @@ class GSPOTrainer:
     def train_epoch(self, dataloader: DataLoader) -> Dict[str, float]:
         """Train for one epoch."""
         self.model.train()
+        print("Model set to training mode.")
         epoch_metrics = {}
         total_loss = 0.0
 
         for step, batch in enumerate(dataloader):
+            print(f"Processing step {step}, batch {batch}.")
+
             # Move batch to device
             device = next(self.model.parameters()).device
             batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
                     for k, v in batch.items()}
+            print(f"Batch moved to device {device}.")
 
             # Forward pass
             loss, metrics = self.training_step(batch)
+            print(f"Loss: {loss.item()}, Metrics: {metrics}.")
 
             # Accumulate loss
             total_loss += loss.item()
+            print(f"Total loss accumulated: {total_loss}.")
 
             # Update epoch metrics
             for k, v in metrics.items():
                 if k not in epoch_metrics:
                     epoch_metrics[k] = []
                 epoch_metrics[k].append(v)
+            print(f"Epoch metrics updated: {epoch_metrics}.")
 
             # Optimizer step
             if (step + 1) % self.config.gradient_accumulation_steps == 0:
                 with self.benchmark_section("optimizer_step"):
+                    print("Performing optimizer step.")
+
                     # Gradient clipping
                     torch.nn.utils.clip_grad_norm_(
                         self.model.parameters(),
                         self.config.max_grad_norm
                     )
+                    print("Gradient clipping performed.")
 
                     # Optimizer step
                     self.optimizer.step()
                     if self.lr_scheduler is not None:
                         self.lr_scheduler.step()
                     self.optimizer.zero_grad()
+                    print("Optimizer step completed.")
 
                 self.global_step += 1
+                print(f"Global step incremented: {self.global_step}.")
 
             # Logging
             if self.global_step % self.config.logging_steps == 0:
                 avg_loss = total_loss / (step + 1)
+                print(f"Average loss at step {self.global_step}: {avg_loss:.6f}.")
                 logger.info(f"Step {self.global_step}: Loss = {avg_loss:.6f}")
                 for k, v in metrics.items():
+                    print(f"Metric {k}: {v:.6f}.")
                     logger.info(f"  {k}: {v:.6f}")
 
         # Average metrics over epoch
         epoch_metrics = {k: np.mean(v) for k, v in epoch_metrics.items()}
         epoch_metrics['epoch_loss'] = total_loss / len(dataloader)
+        print(f"Final epoch metrics: {epoch_metrics}.")
 
         return epoch_metrics
 
