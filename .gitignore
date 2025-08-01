@@ -133,7 +133,7 @@ outputs/
 gspo_outputs/
 logs/
 wandb/
-tensorboard_logs/
+tensorboard_logs
 
 # IDE files
 .vscode/
